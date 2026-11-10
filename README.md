@@ -8,6 +8,10 @@ An EPA-based analytics tool built on the 2021 NFL Big Data Bowl tracking dataset
 
 ---
 
+## the live url
+
+link: https://nfl-player-win-impact.onrender.com
+
 ## Live Demo
 
 > **To run a public live demo**, start the dashboard locally then expose it with [ngrok](https://ngrok.com/download):
@@ -60,3 +64,6 @@ Toggle **Coach View** in the top-right corner to switch all labels from statisti
 ## Data
 
 Source: [NFL Big Data Bowl Regional Event Data](https://github.com/ThompsonJamesBliss/nfl-big-data-bowl-regional-event-data) — `games.csv`, `players.csv`, `plays.csv`, `pffScoutingData.csv`, and 122 per-game tracking files (~833 MB total).
+
+
+
