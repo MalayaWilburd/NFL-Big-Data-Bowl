@@ -251,6 +251,7 @@ def winprob_color(proba):
 # --------------------------------------------------------------------------- #
 app = dash.Dash(__name__, title="NFL Player Win Impact Dashboard")
 app.config.suppress_callback_exceptions = True
+server = app.server  # expose Flask server for gunicorn / Render
 
 player_options = sorted(player_season["displayName"].dropna().unique())
 
