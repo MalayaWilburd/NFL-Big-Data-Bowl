@@ -120,8 +120,13 @@ _win_scaler = StandardScaler()
 _win_X_s = _win_scaler.fit_transform(_win_X)
 _win_model = LogisticRegression(max_iter=1000, random_state=42)
 _win_model.fit(_win_X_s, _win_y)
-_win_acc = _win_model.score(_win_X_s, _win_y)
-_win_auc = roc_auc_score(_win_y, _win_model.predict_proba(_win_X_s)[:, 1])
+# Reported accuracy/AUC are HELD-OUT numbers (5-fold CV grouped by game),
+# computed by src/compute_epa.py. The model above is only used by the
+# interactive calculator, so its in-sample score is never shown.
+_metrics = pd.read_csv(os.path.join(DERIVED, "model_metrics.csv")).iloc[0]
+_win_acc = float(_metrics["heldOutAccuracy"])
+_win_auc = float(_metrics["heldOutAuc"])
+_win_baseline = float(_metrics["baselineAccuracy"])
 
 # Baseline win probability (at league-median values) for delta display
 _baseline_row = pd.DataFrame(
@@ -283,7 +288,7 @@ app.layout = html.Div(
                     html.H1("NFL Player Win Impact Dashboard",
                             style=dict(fontSize=24, fontWeight=700, marginBottom=4)),
                     html.P("EPA-based analysis of how individual player performance "
-                           "correlates with game outcomes — 2021 season tracking data",
+                           "relates to game outcomes — 2021 season, Weeks 1-8",
                            style=dict(color="#8b949e", fontSize=13)),
                 ]),
                 dcc.Checklist(
@@ -400,6 +405,10 @@ def overview_tab(coach_view):
                       color=ACCENT2),
         ]),
         card(title_top, [
+            html.P("Every player on the field gets the play's full EPA, so "
+                   "teammates on the same unit score almost the same. This "
+                   "measures the unit a player was on, not individual impact.",
+                   style=dict(color="#8b949e", fontSize=11, marginBottom=10)),
             html.Div([
                 html.Span("Filter: ", style=dict(color="#8b949e", fontSize=12)),
                 dcc.Dropdown(
@@ -1073,9 +1082,9 @@ def winmodel_tab(coach_view):
     colors = [ACCENT2 if c > 0 else ACCENT3 for c in wf["coefficient"]]
 
     x_label = "Win Impact Score" if coach_view else "Impact on Winning"
-    takeaway = ("Average impact per play is the single strongest predictor of winning."
+    takeaway = ("Average impact per play is the stat most closely tied to winning."
                 if coach_view else
-                "Avg EPA per play is the single strongest predictor of winning.")
+                "Avg EPA per play is the stat most closely tied to winning.")
 
     fig_imp = go.Figure(go.Bar(
         x=wf["coefficient"], y=wf["label"],
@@ -1151,9 +1160,10 @@ def winmodel_tab(coach_view):
     return [
         html.Div(style=dict(display="flex", gap=16, marginBottom=16), children=[
             stat_card("Model Accuracy", f"{_win_acc:.1%}",
-                      subtitle="vs 50% baseline", color=ACCENT2),
+                      subtitle=f"on held-out games · baseline {_win_baseline:.0%}",
+                      color=ACCENT2),
             stat_card("Model AUC", f"{_win_auc:.2f}",
-                      subtitle="0.5=random, 1.0=perfect", color=ACCENT),
+                      subtitle="held-out · 0.5=random, 1.0=perfect", color=ACCENT),
             stat_card("Player-Games", f"{n_pg:,}"),
             stat_card("Games", f"{n_games}"),
         ]),

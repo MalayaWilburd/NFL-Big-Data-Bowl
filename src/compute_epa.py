@@ -24,6 +24,8 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import GroupKFold
+from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score, roc_auc_score
 
@@ -120,32 +122,23 @@ def derive_final_scores(plays, games):
         plays.loc[idx, "homePts"] = hp
         plays.loc[idx, "visPts"] = vp
 
-    # Final score = last play's preSnapScore + points on last play
-    last_plays = plays[is_last].copy()
-    last_plays["finalHomeScore"] = last_plays["preSnapHomeScore"].fillna(0) + last_plays["homePts"]
-    last_plays["finalVisitorScore"] = last_plays["preSnapVisitorScore"].fillna(0) + last_plays["visPts"]
+    # Final scores and winners come from real results, NOT from plays.csv.
+    # plays.csv only holds pass plays (~70 per game), so runs, field goals and
+    # kneel-downs are missing and the score progression cannot be rebuilt.
+    # data/final_scores.csv holds the official 2021 regular-season scores
+    # (source: nflverse/nfldata games.csv, joined on week + home + away team).
+    real = pd.read_csv(os.path.join(DATA_DIR, "final_scores.csv"))
+    games = games.merge(real, on="gameId", how="left")
+    if games[["finalHomeScore", "finalVisitorScore"]].isna().any().any():
+        raise ValueError("final_scores.csv is missing scores for some games")
 
-    final_scores = last_plays[["gameId", "finalHomeScore", "finalVisitorScore"]].copy()
-
-    # Also use the max of (preSnapScore + lastPlayPts) and max preSnapScore as backup
-    max_scores = plays.groupby("gameId").agg(
-        maxHome=("preSnapHomeScore", "max"),
-        maxVis=("preSnapVisitorScore", "max"),
-    ).reset_index()
-    max_scores["maxHome"] = max_scores["maxHome"].fillna(0) + final_scores["finalHomeScore"].fillna(0).values * 0
-    # Use the higher of (last play score) and (max pre-snap score)
-    final_scores = final_scores.merge(max_scores, on="gameId", how="left")
-    final_scores["finalHomeScore"] = np.maximum(
-        final_scores["finalHomeScore"].fillna(0), final_scores["maxHome"].fillna(0))
-    final_scores["finalVisitorScore"] = np.maximum(
-        final_scores["finalVisitorScore"].fillna(0), final_scores["maxVis"].fillna(0))
-
-    # Merge back to games
-    games = games.merge(final_scores[["gameId", "finalHomeScore", "finalVisitorScore"]],
-                        on="gameId", how="left")
-    games["homeWin"] = (games["finalHomeScore"] > games["finalVisitorScore"]).astype(int)
     games["tie"] = (games["finalHomeScore"] == games["finalVisitorScore"]).astype(int)
-    games.loc[games["tie"] == 1, "homeWin"] = 0  # treat ties as non-wins for both
+    # homeWin: 1 = home won, 0 = visitor won, 0.5 = tie (counts as half a win for each team)
+    games["homeWin"] = np.select(
+        [games["finalHomeScore"] > games["finalVisitorScore"],
+         games["finalHomeScore"] < games["finalVisitorScore"]],
+        [1.0, 0.0], default=0.5,
+    )
 
     hw = (games["homeWin"] == 1).sum()
     aw = (games["homeWin"] == 0).sum()
@@ -303,8 +296,14 @@ def attribute_player_epa(plays, pff):
                 "playResult", "passResult", "down", "yardsToGo", "yardline"]
     player_plays = pff.merge(plays[epa_cols], on=["gameId", "playId"], how="left")
 
-    # Offensive roles get raw EPA; defensive roles get negated EPA
-    offensive_roles = {"Pass", "Run", "Pass Block", "Run Block"}
+    # Offensive roles get raw EPA; defensive roles (Pass Rush, Coverage) get
+    # negated EPA. Every play in plays.csv is a pass play, so the offensive
+    # roles are the passer, blockers and route runners.
+    offensive_roles = {"Pass", "Pass Block", "Pass Route"}
+    known_roles = offensive_roles | {"Pass Rush", "Coverage"}
+    unknown = set(player_plays["pff_role"].dropna().unique()) - known_roles
+    if unknown:
+        raise ValueError(f"Unmapped pff_role values: {unknown}")
     player_plays["isOffense"] = player_plays["pff_role"].isin(offensive_roles)
     player_plays["playerEpa"] = np.where(
         player_plays["isOffense"],
@@ -410,19 +409,28 @@ def win_impact_model(pg):
     df = pg.dropna(subset=features + ["teamWon"]).copy()
     df = df[df["snaps"] >= 10]
 
-    X = df[features].fillna(0)
-    y = df["teamWon"].astype(int)
+    X = df[features].fillna(0).to_numpy()
+    y = df["teamWon"].astype(int).to_numpy()
+    groups = df["gameId"].to_numpy()
 
+    # Held-out evaluation: 5-fold cross-validation grouped by game, so every
+    # player from a given game is either all in training or all in testing.
+    accs, aucs = [], []
+    for train_idx, test_idx in GroupKFold(n_splits=5).split(X, y, groups):
+        fold_model = make_pipeline(
+            StandardScaler(), LogisticRegression(max_iter=1000, random_state=42))
+        fold_model.fit(X[train_idx], y[train_idx])
+        fold_proba = fold_model.predict_proba(X[test_idx])[:, 1]
+        accs.append(accuracy_score(y[test_idx], fold_proba >= 0.5))
+        aucs.append(roc_auc_score(y[test_idx], fold_proba))
+    acc, auc = float(np.mean(accs)), float(np.mean(aucs))
+    baseline = float(max(y.mean(), 1 - y.mean()))
+
+    # Final model on all data, used only to read off the coefficients.
     scaler = StandardScaler()
     X_s = scaler.fit_transform(X)
-
     model = LogisticRegression(max_iter=1000, random_state=42)
     model.fit(X_s, y)
-
-    preds = model.predict(X_s)
-    proba = model.predict_proba(X_s)[:, 1]
-    acc = accuracy_score(y, preds)
-    auc = roc_auc_score(y, proba)
 
     importance = pd.DataFrame({
         "feature": features,
@@ -430,17 +438,26 @@ def win_impact_model(pg):
         "abs_coef": np.abs(model.coef_[0]),
     }).sort_values("abs_coef", ascending=False)
 
-    print(f"  Win model accuracy: {acc:.4f}  AUC: {auc:.4f}")
+    metrics = pd.DataFrame([{
+        "heldOutAccuracy": acc, "heldOutAccuracyStd": float(np.std(accs)),
+        "heldOutAuc": auc, "heldOutAucStd": float(np.std(aucs)),
+        "baselineAccuracy": baseline,
+        "rows": len(df), "games": int(df["gameId"].nunique()), "folds": 5,
+    }])
+
+    print(f"  Held-out (5-fold, grouped by game): accuracy {acc:.4f} "
+          f"(+/-{np.std(accs):.4f})  AUC {auc:.4f} (+/-{np.std(aucs):.4f})")
+    print(f"  Baseline (always guess the majority outcome): {baseline:.4f}")
     for _, row in importance.head(5).iterrows():
         print(f"    {row['feature']:>20s}  coef={row['coefficient']:+.4f}")
 
-    return importance, acc, auc
+    return importance, metrics
 
 
 # --------------------------------------------------------------------------- #
 # 9.  Save outputs
 # --------------------------------------------------------------------------- #
-def save_outputs(games, plays, pg, ps, importance):
+def save_outputs(games, plays, pg, ps, importance, metrics):
     print("Saving derived CSVs ...")
     games[["gameId", "season", "week", "gameDate", "homeTeamAbbr", "visitorTeamAbbr",
            "finalHomeScore", "finalVisitorScore", "homeWin", "tie"]].to_csv(
@@ -454,7 +471,8 @@ def save_outputs(games, plays, pg, ps, importance):
     pg.to_csv(os.path.join(OUT_DIR, "player_game_stats.csv"), index=False)
     ps.to_csv(os.path.join(OUT_DIR, "player_season_stats.csv"), index=False)
     importance.to_csv(os.path.join(OUT_DIR, "win_impact_features.csv"), index=False)
-    print(f"  Saved 5 CSVs to {OUT_DIR}")
+    metrics.to_csv(os.path.join(OUT_DIR, "model_metrics.csv"), index=False)
+    print(f"  Saved 6 CSVs to {OUT_DIR}")
 
 
 # --------------------------------------------------------------------------- #
@@ -468,8 +486,8 @@ def main():
     plays = compute_epa(plays, ep_model)
     player_plays = attribute_player_epa(plays, pff)
     pg, ps = aggregate_player_stats(player_plays, games, players)
-    importance, acc, auc = win_impact_model(pg)
-    save_outputs(games, plays, pg, ps, importance)
+    importance, metrics = win_impact_model(pg)
+    save_outputs(games, plays, pg, ps, importance, metrics)
     print("\nPipeline complete.  Derived data saved to data/derived/")
 
 
